@@ -189,7 +189,7 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    public Object visitCommitCommand(TxInvocationContext ctx, CommitCommand command) throws Throwable {
       if (shouldInvokeRemoteTxCommand(ctx)) {
          Collection<Address> recipients = getCommitNodes(ctx);
-         Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, createCommitRpcOptions());
+          Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, createRpcOptionsFor2ndPhase(cacheConfiguration.transaction().syncCommitPhase()));
          checkTxCommandResponses(responseMap, command, (LocalTxInvocationContext) ctx, recipients);
       }
       return invokeNextInterceptor(ctx, command);
@@ -211,7 +211,9 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    protected void prepareOnAffectedNodes(TxInvocationContext<?> ctx, PrepareCommand command, Collection<Address> recipients) {
       try {
          // this method will return immediately if we're the only member (because exclude_self=true)
-         Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, createPrepareRpcOptions());
+          Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, cacheConfiguration.clustering().cacheMode().isSynchronous() ?
+                  rpcManager.getRpcOptionsBuilder(ResponseMode.SYNCHRONOUS_IGNORE_LEAVERS, DeliverOrder.NONE).build() :
+                  rpcManager.getDefaultRpcOptions(false));
          checkTxCommandResponses(responseMap, command, (LocalTxInvocationContext) ctx, recipients);
       } finally {
          transactionRemotelyPrepared(ctx);
@@ -222,7 +224,7 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
    public Object visitRollbackCommand(TxInvocationContext ctx, RollbackCommand command) throws Throwable {
       if (shouldInvokeRemoteTxCommand(ctx)) {
          Collection<Address> recipients = getCommitNodes(ctx);
-         Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, createRollbackRpcOptions());
+          Map<Address, Response> responseMap = rpcManager.invokeRemotely(recipients, command, createRpcOptionsFor2ndPhase(cacheConfiguration.transaction().syncRollbackPhase()));
          checkTxCommandResponses(responseMap, command, (LocalTxInvocationContext) ctx, recipients);
       }
 
@@ -307,10 +309,10 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
     * If we are within one transaction we won't do any replication as replication would only be performed at commit
     * time. If the operation didn't originate locally we won't do any replication either.
     */
-   private Object handleTxWriteCommand(InvocationContext ctx, WriteCommand command, Object key, boolean skipRemoteGet) throws Throwable {
+   private Object handleTxWriteCommand(InvocationContext ctx, WriteCommand command, Object recipientGenerator, boolean skipRemoteGet) throws Throwable {
       // see if we need to load values from remote sources first
       if (!skipRemoteGet && needValuesFromPreviousOwners(ctx, command))
-         remoteGetBeforeWrite(ctx, command, key);
+         remoteGetBeforeWrite(ctx, command, recipientGenerator);
 
       // FIRST pass this call up the chain.  Only if it succeeds (no exceptions) locally do we attempt to distribute.
       return invokeNextInterceptor(ctx, command);
@@ -398,15 +400,7 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
       return null;
    }
 
-   private RpcOptions createCommitRpcOptions() {
-      return createRpcOptionsFor2ndPhase(cacheConfiguration.transaction().syncCommitPhase());
-   }
-
-   private RpcOptions createRollbackRpcOptions() {
-      return createRpcOptionsFor2ndPhase(cacheConfiguration.transaction().syncRollbackPhase());
-   }
-
-   private RpcOptions createRpcOptionsFor2ndPhase(boolean sync) {
+    private RpcOptions createRpcOptionsFor2ndPhase(boolean sync) {
       if (sync) {
          return rpcManager.getRpcOptionsBuilder(ResponseMode.SYNCHRONOUS_IGNORE_LEAVERS, DeliverOrder.NONE).build();
       } else {
@@ -414,9 +408,4 @@ public class TxDistributionInterceptor extends BaseDistributionInterceptor {
       }
    }
 
-   protected RpcOptions createPrepareRpcOptions() {
-      return cacheConfiguration.clustering().cacheMode().isSynchronous() ?
-              rpcManager.getRpcOptionsBuilder(ResponseMode.SYNCHRONOUS_IGNORE_LEAVERS, DeliverOrder.NONE).build() :
-              rpcManager.getDefaultRpcOptions(false);
-   }
 }
