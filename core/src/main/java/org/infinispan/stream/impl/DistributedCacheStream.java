@@ -430,9 +430,160 @@ public class DistributedCacheStream<R> extends AbstractCacheStream<R, Stream<R>,
       boolean iteratorParallelDistribute = parallelDistribution == null ? false : parallelDistribution;
 
       if (rehashAware) {
-         rehashAwareIteration(complete, consumer, supplier, iteratorParallelDistribute);
+          ConsistentHash segmentInfoCH = dm.getReadConsistentHash();
+          SegmentListenerNotifier<R> listenerNotifier;
+          if (segmentCompletionListener != null) {
+             listenerNotifier = new SegmentListenerNotifier<>(
+                     segmentCompletionListener);
+             supplier.setConsumer(listenerNotifier);
+          } else {
+             listenerNotifier = null;
+          }
+          KeyTrackingConsumer<Object, R> results = new KeyTrackingConsumer<>(segmentInfoCH,
+                  iteratorOperation.wrapConsumer(consumer), iteratorOperation.getFunction(),
+                  listenerNotifier);
+          Thread thread = Thread.currentThread();
+          executor.execute(() -> {
+             try {
+                log.tracef("Thread %s submitted iterator request for stream", thread);
+                Set<Integer> segmentsToProcess = segmentsToFilter == null ?
+                        new ReplicatedConsistentHash.RangeSet(segmentInfoCH.getNumSegments()) : segmentsToFilter;
+                do {
+                   ConsistentHash ch = dm.getReadConsistentHash();
+                   boolean runLocal = ch.getMembers().contains(localAddress);
+                   Set<Integer> segments;
+                   Set<Object> excludedKeys;
+                   boolean stayLocal = false;
+                   if (runLocal) {
+                      Set<Integer> segmentsForOwner = ch.getSegmentsForOwner(localAddress);
+                      stayLocal = segmentsToFilter != null && segmentsForOwner.containsAll(segmentsToFilter);
+                      segments = stayLocal ? segmentsForOwner : ch.getPrimarySegmentsForOwner(localAddress);
+                      segments.retainAll(segmentsToProcess);
+
+                      excludedKeys = segments.stream().flatMap(s -> results.referenceArray.get(s).stream())
+                              .collect(Collectors.toSet());
+                   } else {
+                      segments = null;
+                      excludedKeys = Collections.emptySet();
+                   }
+                   KeyTrackingTerminalOperation<Object, R, Object> op = iteratorOperation.getOperation(
+                           intermediateOperations, supplierForSegments(ch, segmentsToProcess, excludedKeys, !stayLocal),
+                           distributedBatchSize);
+                   if (!stayLocal) {
+                      UUID id = csm.remoteStreamOperationRehashAware(iteratorParallelDistribute, parallel, ch,
+                              segmentsToProcess, keysToFilter, new AtomicReferenceArrayToMap<>(results.referenceArray),
+                              includeLoader, op, results);
+                      supplier.pending = id;
+                      try {
+                         if (runLocal) {
+                             Collection<CacheEntry<Object, Object>> localValue = op.performOperationRehashAware(results);
+                             // TODO: we can do this more efficiently - this hampers performance during rehash
+                             if (dm.getReadConsistentHash().equals(ch)) {
+                                log.tracef("Found local values %s for id %s", localValue.size(), id);
+                                results.onCompletion(null, segments, localValue);
+                             } else {
+                                Set<Integer> ourSegments = ((Supplier<Set<Integer>>) () -> ch.getPrimarySegmentsForOwner(localAddress)).get();
+                                ourSegments.retainAll(segmentsToProcess);
+                                log.tracef("CH changed - making %s segments suspect for identifier %s", ourSegments, id);
+                                results.onSegmentsLost(ourSegments);
+                             }
+                         }
+                         try {
+                            if (!csm.awaitCompletion(id, 30, TimeUnit.SECONDS)) {
+                               throw new TimeoutException();
+                            }
+                         } catch (InterruptedException e) {
+                            throw new CacheException(e);
+                         }
+                          Set<Integer> segmentsToProcess1 = segmentsToProcess;
+                          String strId = id == null ? "local" : id.toString();
+                          if (!results.lostSegments.isEmpty()) {
+                             segmentsToProcess1 = new HashSet<>(results.lostSegments);
+                             results.lostSegments.clear();
+                             log.tracef("Found %s lost segments for %s", segmentsToProcess1, strId);
+                          } else {
+                             supplier.close();
+                             log.tracef("Finished rehash aware operation for %s", strId);
+                          }
+                          segmentsToProcess = segmentsToProcess1;
+                      } finally {
+                         csm.forgetOperation(id);
+                      }
+                   } else {
+                       Collection<CacheEntry<Object, Object>> localValue = op.performOperationRehashAware(results);
+                       // TODO: we can do this more efficiently - this hampers performance during rehash
+                       if (dm.getReadConsistentHash().equals(ch)) {
+                          log.tracef("Found local values %s for id %s", localValue.size(), null);
+                          results.onCompletion(null, segments, localValue);
+                       } else {
+                          Set<Integer> ourSegments = ((Supplier<Set<Integer>>) () -> ch.getSegmentsForOwner(localAddress)).get();
+                          ourSegments.retainAll(segmentsToProcess);
+                          log.tracef("CH changed - making %s segments suspect for identifier %s", ourSegments, null);
+                          results.onSegmentsLost(ourSegments);
+                       }
+                       Set<Integer> segmentsToProcess1 = segmentsToProcess;
+                       String strId = null == null ? "local" : ((UUID) null).toString();
+                       if (!results.lostSegments.isEmpty()) {
+                          segmentsToProcess1 = new HashSet<>(results.lostSegments);
+                          results.lostSegments.clear();
+                          log.tracef("Found %s lost segments for %s", segmentsToProcess1, strId);
+                       } else {
+                          supplier.close();
+                          log.tracef("Finished rehash aware operation for %s", strId);
+                       }
+                       segmentsToProcess = segmentsToProcess1;
+                   }
+                } while (!complete.get());
+             } catch (CacheException e) {
+                log.trace("Encountered local cache exception for stream", e);
+                supplier.close(e);
+             } catch (Throwable t) {
+                log.trace("Encountered local throwable for stream", t);
+                supplier.close(new CacheException(t));
+             }
+          });
       } else {
-         ignoreRehashIteration(consumer, supplier, iteratorParallelDistribute);
+          CollectionConsumer<R> remoteResults = new CollectionConsumer<>(consumer);
+          ConsistentHash ch = dm.getConsistentHash();
+
+          boolean stayLocal = ch.getMembers().contains(localAddress) && segmentsToFilter != null
+                  && ch.getSegmentsForOwner(localAddress).containsAll(segmentsToFilter);
+
+          NoMapIteratorOperation<?, R> op = new NoMapIteratorOperation<>(intermediateOperations, supplierForSegments(ch,
+                  segmentsToFilter, null, !stayLocal), distributedBatchSize);
+
+          Thread thread = Thread.currentThread();
+          executor.execute(() -> {
+             try {
+                log.tracef("Thread %s submitted iterator request for stream", thread);
+                Collection<R> localValue = op.performOperation(remoteResults);
+                remoteResults.onCompletion(null, Collections.emptySet(), localValue);
+                if (!stayLocal) {
+                   UUID id = csm.remoteStreamOperation(iteratorParallelDistribute, parallel, ch, segmentsToFilter,
+                           keysToFilter, Collections.emptyMap(), includeLoader, op, remoteResults);
+                   supplier.pending = id;
+                   try {
+                      try {
+                         if (!csm.awaitCompletion(id, 30, TimeUnit.SECONDS)) {
+                            throw new TimeoutException();
+                         }
+                      } catch (InterruptedException e) {
+                         throw new CacheException(e);
+                      }
+
+                   } finally {
+                      csm.forgetOperation(id);
+                   }
+                }
+                supplier.close();
+             } catch (CacheException e) {
+                log.trace("Encountered local cache exception for stream", e);
+                supplier.close(e);
+             } catch (Throwable t) {
+                log.trace("Encountered local throwable for stream", t);
+                supplier.close(new CacheException(t));
+             }
+          });
       }
 
       CloseableIterator<R> closeableIterator = new CloseableSuppliedIterator<>(supplier);
@@ -440,162 +591,7 @@ public class DistributedCacheStream<R> extends AbstractCacheStream<R, Stream<R>,
       return closeableIterator;
    }
 
-   private void ignoreRehashIteration(Consumer<R> consumer, IteratorSupplier<R> supplier, boolean iteratorParallelDistribute) {
-      CollectionConsumer<R> remoteResults = new CollectionConsumer<>(consumer);
-      ConsistentHash ch = dm.getConsistentHash();
-
-      boolean stayLocal = ch.getMembers().contains(localAddress) && segmentsToFilter != null
-              && ch.getSegmentsForOwner(localAddress).containsAll(segmentsToFilter);
-
-      NoMapIteratorOperation<?, R> op = new NoMapIteratorOperation<>(intermediateOperations, supplierForSegments(ch,
-              segmentsToFilter, null, !stayLocal), distributedBatchSize);
-
-      Thread thread = Thread.currentThread();
-      executor.execute(() -> {
-         try {
-            log.tracef("Thread %s submitted iterator request for stream", thread);
-            Collection<R> localValue = op.performOperation(remoteResults);
-            remoteResults.onCompletion(null, Collections.emptySet(), localValue);
-            if (!stayLocal) {
-               UUID id = csm.remoteStreamOperation(iteratorParallelDistribute, parallel, ch, segmentsToFilter,
-                       keysToFilter, Collections.emptyMap(), includeLoader, op, remoteResults);
-               supplier.pending = id;
-               try {
-                  try {
-                     if (!csm.awaitCompletion(id, 30, TimeUnit.SECONDS)) {
-                        throw new TimeoutException();
-                     }
-                  } catch (InterruptedException e) {
-                     throw new CacheException(e);
-                  }
-
-               } finally {
-                  csm.forgetOperation(id);
-               }
-            }
-            supplier.close();
-         } catch (CacheException e) {
-            log.trace("Encountered local cache exception for stream", e);
-            supplier.close(e);
-         } catch (Throwable t) {
-            log.trace("Encountered local throwable for stream", t);
-            supplier.close(new CacheException(t));
-         }
-      });
-   }
-
-   private void rehashAwareIteration(AtomicBoolean complete, Consumer<R> consumer, IteratorSupplier<R> supplier, boolean iteratorParallelDistribute) {
-      ConsistentHash segmentInfoCH = dm.getReadConsistentHash();
-      SegmentListenerNotifier<R> listenerNotifier;
-      if (segmentCompletionListener != null) {
-         listenerNotifier = new SegmentListenerNotifier<>(
-                 segmentCompletionListener);
-         supplier.setConsumer(listenerNotifier);
-      } else {
-         listenerNotifier = null;
-      }
-      KeyTrackingConsumer<Object, R> results = new KeyTrackingConsumer<>(segmentInfoCH,
-              iteratorOperation.wrapConsumer(consumer), iteratorOperation.getFunction(),
-              listenerNotifier);
-      Thread thread = Thread.currentThread();
-      executor.execute(() -> {
-         try {
-            log.tracef("Thread %s submitted iterator request for stream", thread);
-            Set<Integer> segmentsToProcess = segmentsToFilter == null ?
-                    new ReplicatedConsistentHash.RangeSet(segmentInfoCH.getNumSegments()) : segmentsToFilter;
-            do {
-               ConsistentHash ch = dm.getReadConsistentHash();
-               boolean runLocal = ch.getMembers().contains(localAddress);
-               Set<Integer> segments;
-               Set<Object> excludedKeys;
-               boolean stayLocal = false;
-               if (runLocal) {
-                  Set<Integer> segmentsForOwner = ch.getSegmentsForOwner(localAddress);
-                  stayLocal = segmentsToFilter != null && segmentsForOwner.containsAll(segmentsToFilter);
-                  segments = stayLocal ? segmentsForOwner : ch.getPrimarySegmentsForOwner(localAddress);
-                  segments.retainAll(segmentsToProcess);
-
-                  excludedKeys = segments.stream().flatMap(s -> results.referenceArray.get(s).stream())
-                          .collect(Collectors.toSet());
-               } else {
-                  segments = null;
-                  excludedKeys = Collections.emptySet();
-               }
-               KeyTrackingTerminalOperation<Object, R, Object> op = iteratorOperation.getOperation(
-                       intermediateOperations, supplierForSegments(ch, segmentsToProcess, excludedKeys, !stayLocal),
-                       distributedBatchSize);
-               if (!stayLocal) {
-                  UUID id = csm.remoteStreamOperationRehashAware(iteratorParallelDistribute, parallel, ch,
-                          segmentsToProcess, keysToFilter, new AtomicReferenceArrayToMap<>(results.referenceArray),
-                          includeLoader, op, results);
-                  supplier.pending = id;
-                  try {
-                     if (runLocal) {
-                        performLocalRehashAwareOperation(results, segmentsToProcess, ch, segments, op,
-                                () -> ch.getPrimarySegmentsForOwner(localAddress), id);
-                     }
-                     try {
-                        if (!csm.awaitCompletion(id, 30, TimeUnit.SECONDS)) {
-                           throw new TimeoutException();
-                        }
-                     } catch (InterruptedException e) {
-                        throw new CacheException(e);
-                     }
-                     segmentsToProcess = segmentsToProcess(supplier, results, segmentsToProcess, id);
-                  } finally {
-                     csm.forgetOperation(id);
-                  }
-               } else {
-                  performLocalRehashAwareOperation(results, segmentsToProcess, ch, segments, op,
-                          () -> ch.getSegmentsForOwner(localAddress), null);
-                  segmentsToProcess = segmentsToProcess(supplier, results, segmentsToProcess, null);
-               }
-            } while (!complete.get());
-         } catch (CacheException e) {
-            log.trace("Encountered local cache exception for stream", e);
-            supplier.close(e);
-         } catch (Throwable t) {
-            log.trace("Encountered local throwable for stream", t);
-            supplier.close(new CacheException(t));
-         }
-      });
-   }
-
-   private Set<Integer> segmentsToProcess(IteratorSupplier<R> supplier, KeyTrackingConsumer<Object, R> results,
-                                          Set<Integer> segmentsToProcess, UUID id) {
-      String strId = id == null ? "local" : id.toString();
-      if (!results.lostSegments.isEmpty()) {
-         segmentsToProcess = new HashSet<>(results.lostSegments);
-         results.lostSegments.clear();
-         log.tracef("Found %s lost segments for %s", segmentsToProcess, strId);
-      } else {
-         supplier.close();
-         log.tracef("Finished rehash aware operation for %s", strId);
-      }
-      return segmentsToProcess;
-   }
-
-   private void performLocalRehashAwareOperation(KeyTrackingConsumer<Object, R> results,
-                                                 Set<Integer> segmentsToProcess,
-                                                 ConsistentHash ch,
-                                                 Set<Integer> segments,
-                                                 KeyTrackingTerminalOperation<Object, R, Object> op,
-                                                 Supplier<Set<Integer>> ownedSegmentsSupplier,
-                                                 UUID id) {
-      Collection<CacheEntry<Object, Object>> localValue = op.performOperationRehashAware(results);
-      // TODO: we can do this more efficiently - this hampers performance during rehash
-      if (dm.getReadConsistentHash().equals(ch)) {
-         log.tracef("Found local values %s for id %s", localValue.size(), id);
-         results.onCompletion(null, segments, localValue);
-      } else {
-         Set<Integer> ourSegments = ownedSegmentsSupplier.get();
-         ourSegments.retainAll(segmentsToProcess);
-         log.tracef("CH changed - making %s segments suspect for identifier %s", ourSegments, id);
-         results.onSegmentsLost(ourSegments);
-      }
-   }
-
-   static class HandOffConsumer<R> implements Consumer<R> {
+    static class HandOffConsumer<R> implements Consumer<R> {
       private final BlockingQueue<R> queue;
       private final AtomicBoolean completed;
       private final Lock nextLock;
