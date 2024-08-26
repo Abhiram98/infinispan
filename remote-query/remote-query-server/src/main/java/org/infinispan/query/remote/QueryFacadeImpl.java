@@ -128,7 +128,7 @@ public final class QueryFacadeImpl implements QueryFacade {
          if (expansion == normalizedExpr) {  // identity comparison is intended here!
             // everything is indexed, so go the Lucene way
             //todo [anistor] we should be able to generate the lucene query ourselves rather than depend on hibernate-hql-lucene to do it
-            return buildLuceneQuery(cache, isCompatMode, serCtx, request.getJpqlString(), request.getStartOffset(), request.getMaxResults());
+            return executeIndexedQuery(cache, isCompatMode, serCtx, request.getJpqlString(), request.getStartOffset(), request.getMaxResults());
          }
 
          if (expansion == ConstantBooleanExpr.TRUE) {
@@ -137,7 +137,7 @@ public final class QueryFacadeImpl implements QueryFacade {
          }
 
          String expandedJpaOut = JPATreePrinter.printTree(parsingResult.getTargetEntityName(), expansion, null);
-         Query expandedQuery = buildLuceneQuery(cache, isCompatMode, serCtx, expandedJpaOut, -1, -1);
+         Query expandedQuery = executeIndexedQuery(cache, isCompatMode, serCtx, expandedJpaOut, -1, -1);
          // results are already in protobuf format due to type converter interceptor even if we are in compat mode ...
          ProtobufMatcher protobufMatcher = SecurityActions.getCacheComponentRegistry(cache).getComponent(ProtobufMatcher.class);
          ObjectFilter objectFilter = protobufMatcher.getObjectFilter(request.getJpqlString());
@@ -165,7 +165,7 @@ public final class QueryFacadeImpl implements QueryFacade {
    /**
     * Build a Lucene index query.
     */
-   private Query buildLuceneQuery(AdvancedCache<?, ?> cache, boolean isCompatMode, SerializationContext serCtx, String jpqlString, long startOffset, int maxResults) {
+   private Query executeIndexedQuery(AdvancedCache<?, ?> cache, boolean isCompatMode, SerializationContext serCtx, String jpqlString, long startOffset, int maxResults) {
       final SearchManager searchManager = Search.getSearchManager(cache);     // this also checks access permissions
       final SearchIntegrator searchFactory = searchManager.unwrap(SearchIntegrator.class);
       final QueryCache queryCache = ComponentRegistryUtils.getQueryCache(cache);  // optional component
@@ -176,11 +176,11 @@ public final class QueryFacadeImpl implements QueryFacade {
          KeyValuePair<String, Class> queryCacheKey = new KeyValuePair<String, Class>(jpqlString, LuceneQueryParsingResult.class);
          parsingResult = queryCache.get(queryCacheKey);
          if (parsingResult == null) {
-            parsingResult = transformJpaToLucene(isCompatMode, serCtx, jpqlString, searchFactory);
+            parsingResult = parseQuery(isCompatMode, serCtx, jpqlString, searchFactory);
             queryCache.put(queryCacheKey, parsingResult);
          }
       } else {
-         parsingResult = transformJpaToLucene(isCompatMode, serCtx, jpqlString, searchFactory);
+         parsingResult = parseQuery(isCompatMode, serCtx, jpqlString, searchFactory);
       }
 
       org.apache.lucene.search.Query luceneQuery = parsingResult.getQuery();
@@ -215,7 +215,7 @@ public final class QueryFacadeImpl implements QueryFacade {
       return new EmbeddedLuceneQuery(null, jpqlString, projection, cacheQuery);
    }
 
-   private LuceneQueryParsingResult transformJpaToLucene(boolean isCompatMode, final SerializationContext serCtx, String jpqlString, SearchIntegrator searchFactory) {
+   private LuceneQueryParsingResult parseQuery(boolean isCompatMode, final SerializationContext serCtx, String queryString, SearchIntegrator searchFactory) {
       LuceneProcessingChain processingChain;
       if (isCompatMode) {
          EntityNamesResolver entityNamesResolver = new EntityNamesResolver() {
@@ -272,7 +272,7 @@ public final class QueryFacadeImpl implements QueryFacade {
                .buildProcessingChainForDynamicEntities(fieldBridgeProvider);
       }
 
-      return queryParser.parseQuery(jpqlString, processingChain);
+      return queryParser.parseQuery(queryString, processingChain);
    }
 
    private FieldDescriptor getFieldDescriptor(SerializationContext serCtx, String type, String attributePath) {
